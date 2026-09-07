@@ -1,0 +1,5 @@
+opencv-python>=4.9
+numpy>=1.26
+pillow>=10.0
+PySide6>=6.6
+pytest>=8.0

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windowautomation"
+version = "0.1.0"
+description = "Screenshot template recognition and click automation for KDE Plasma Wayland"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+windowautomation = "windowautomation.cli:main"
+windowautomation-gui = "windowautomation.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
