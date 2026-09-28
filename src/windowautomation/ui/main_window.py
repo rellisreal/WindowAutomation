@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -30,13 +30,30 @@ from windowautomation.ui.settings_dialog import SettingsDialog
 from windowautomation.ui.template_preview import TemplatePreview, import_templates
 
 
+class _PollWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__()
+        self._main_window = main_window
+
+    def run(self) -> None:
+        result = self._main_window._poll_cycle_work()
+        self.finished.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Config, config_path: Path | None = None):
         super().__init__()
         self.config = config
         self.config_path = config_path
+        self._template_cache: dict[str, tuple[float, np.ndarray]] = {}
+        self._poll_in_progress = False
+        self._no_match_streak = 0
         self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self.run_tick)
+        self.poll_timer.timeout.connect(self._poll_tick)
+        self._poll_worker = _PollWorker(self)
+        self._poll_worker.finished.connect(self._handle_poll_result)
         self.setWindowTitle("WindowAutomation")
         self.resize(1100, 700)
 
@@ -56,6 +73,7 @@ class MainWindow(QMainWindow):
         self.interval.setRange(100, 60000)
         self.interval.setSuffix(" ms")
         self.interval.setValue(1000)
+        self.interval.valueChanged.connect(self._interval_changed)
         self.offset_x = QSpinBox()
         self.offset_x.setRange(-10000, 10000)
         self.offset_x.setPrefix("X ")
@@ -165,6 +183,37 @@ class MainWindow(QMainWindow):
         screens = self.screen_list()
         selected_name = self.monitor.currentData()
         return next((screen for screen in screens if screen.name() == selected_name), None)
+
+    def _capture_for_matching(self):
+        screen = self.selected_screen()
+        if screen is None:
+            return capture.capture_screen()
+        screens = self.screen_list()
+        if not screens:
+            return capture.capture_screen()
+        virtual_x = min(s.geometry().x() for s in screens)
+        virtual_y = min(s.geometry().y() for s in screens)
+        virtual_right = max(s.geometry().x() + s.geometry().width() for s in screens)
+        virtual_bottom = max(s.geometry().y() + s.geometry().height() for s in screens)
+        rect = screen.geometry()
+        return capture.capture_monitor(
+            (rect.x(), rect.y(), rect.width(), rect.height()),
+            (virtual_x, virtual_y, virtual_right - virtual_x, virtual_bottom - virtual_y),
+        )
+
+    def _load_template(self, path: str) -> np.ndarray | None:
+        full_path = str(Path(path).expanduser())
+        try:
+            mtime = Path(full_path).stat().st_mtime
+        except OSError:
+            return None
+        cached = self._template_cache.get(full_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        image = cv2.imread(full_path)
+        if image is not None:
+            self._template_cache[full_path] = (mtime, image)
+        return image
 
     def guided_capture(self) -> None:
         screen = self.selected_screen()
@@ -334,6 +383,7 @@ class MainWindow(QMainWindow):
         action.click_offset_x = updated.click_offset_x
         action.click_offset_y = updated.click_offset_y
         action.poll_interval_s = updated.poll_interval_s
+        action.poll_enabled = updated.poll_enabled
         if self.config_path:
             save_config(self.config, self.config_path)
         row = self.action_list.currentRow()
@@ -378,17 +428,88 @@ class MainWindow(QMainWindow):
         if self.config_path:
             save_config(self.config, self.config_path)
 
+    def _interval_changed(self, value: int) -> None:
+        if self.poll_timer.isActive() and not self._poll_in_progress:
+            self.poll_timer.setInterval(value)
+
+    def _poll_tick(self) -> None:
+        if self._poll_in_progress:
+            return
+        self._poll_in_progress = True
+        self._poll_worker.run()
+
+    def _handle_poll_result(self, result: dict) -> None:
+        self._poll_in_progress = False
+        if result.get("message"):
+            self._report(result["message"])
+        if result.get("matched"):
+            self._no_match_streak = 0
+            self.poll_timer.setInterval(self.interval.value())
+            return
+        self._no_match_streak += 1
+        if self._no_match_streak > 1:
+            current_interval = self.poll_timer.interval()
+            next_interval = min(max(current_interval * 2, self.interval.value()), 10000)
+            self.poll_timer.setInterval(next_interval)
+
+    def _poll_cycle_work(self) -> dict:
+        if self.run_all_checkbox.isChecked():
+            enabled_actions = [action for action in self.config.actions if action.poll_enabled]
+            if not enabled_actions:
+                return {"matched": False, "message": "No enabled actions configured"}
+            try:
+                screen = self._capture_for_matching()
+            except capture.CaptureError as exc:
+                return {"matched": False, "message": f"Capture failed: {exc}"}
+            for action in enabled_actions:
+                template = self._load_template(action.template_path)
+                if template is None:
+                    continue
+                result = find_template(screen, template, action.threshold)
+                if result is None:
+                    continue
+                x, y = result.x, result.y
+                click_x, click_y = x + action.click_offset_x, y + action.click_offset_y
+                try:
+                    input_ctl.click(click_x, click_y, self.config.ydotool_socket)
+                except input_ctl.InputError as exc:
+                    return {"matched": False, "message": f"{action.name}: {exc}"}
+                return {"matched": True, "message": f"{action.name}: matched ({x}, {y}), clicked ({click_x}, {click_y}), confidence {result.confidence:.3f}"}
+            return {"matched": False, "message": f"No match among {len(enabled_actions)} enabled action(s)"}
+
+        action = self.selected_action()
+        if action is None:
+            return {"matched": False, "message": "No action selected"}
+        template = self._load_template(action.template_path)
+        if template is None:
+            return {"matched": False, "message": f"{action.name}: cannot read {action.template_path}"}
+        try:
+            screen = self._capture_for_matching()
+        except capture.CaptureError as exc:
+            return {"matched": False, "message": f"Capture failed: {exc}"}
+        result = find_template(screen, template, action.threshold)
+        if result is None:
+            return {"matched": False, "message": f"{action.name}: no match above {action.threshold:.2f}"}
+        x, y = result.x, result.y
+        click_x, click_y = x + action.click_offset_x, y + action.click_offset_y
+        try:
+            input_ctl.click(click_x, click_y, self.config.ydotool_socket)
+        except input_ctl.InputError as exc:
+            return {"matched": False, "message": f"{action.name}: {exc}"}
+        return {"matched": True, "message": f"{action.name}: matched ({x}, {y}), clicked ({click_x}, {click_y}), confidence {result.confidence:.3f}"}
+
     def run_selected(self) -> None:
         action = self.selected_action()
         if action is None:
             self.status.setText("No action selected")
             return
-        template = cv2.imread(action.template_path)
+        template = self._load_template(action.template_path)
         if template is None:
             self._report(f"{action.name}: cannot read {action.template_path}")
             return
         try:
-            result = find_template(capture.capture_screen(), template, action.threshold)
+            screen = self._capture_for_matching()
+            result = find_template(screen, template, action.threshold)
             if result is None:
                 self._report(f"{action.name}: no match above {action.threshold:.2f}")
                 return
@@ -406,16 +527,17 @@ class MainWindow(QMainWindow):
             self.run_selected()
 
     def run_all_actions(self) -> None:
-        if not self.config.actions:
-            self.status.setText("No actions configured")
+        enabled_actions = [action for action in self.config.actions if action.poll_enabled]
+        if not enabled_actions:
+            self.status.setText("No enabled actions configured")
             return
         try:
-            screen = capture.capture_screen()
+            screen = self._capture_for_matching()
         except capture.CaptureError as exc:
             self._report(f"Capture failed: {exc}")
             return
-        for action in self.config.actions:
-            template = cv2.imread(action.template_path)
+        for action in enabled_actions:
+            template = self._load_template(action.template_path)
             if template is None:
                 continue
             result = find_template(screen, template, action.threshold)
@@ -430,7 +552,7 @@ class MainWindow(QMainWindow):
                 return
             self._report(f"{action.name}: matched ({x}, {y}), clicked ({click_x}, {click_y}), confidence {result.confidence:.3f}")
             return
-        self._report(f"No match among {len(self.config.actions)} action(s)")
+        self._report(f"No match among {len(enabled_actions)} enabled action(s)")
 
     def toggle_polling(self) -> None:
         if self.poll_timer.isActive():
@@ -441,10 +563,12 @@ class MainWindow(QMainWindow):
         if not self.run_all_checkbox.isChecked() and self.selected_action() is None:
             QMessageBox.information(self, "Polling", "Select an action first.")
             return
+        self._no_match_streak = 0
+        self.poll_timer.setInterval(self.interval.value())
         self.poll_timer.start(self.interval.value())
         self.poll_button.setText("Stop polling")
         self.status.setText("Polling active")
-        self.run_tick()
+        self._poll_tick()
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)

@@ -22,7 +22,7 @@ class Action:
     click_offset_x: int = 0
     click_offset_y: int = 0
     poll_interval_s: float = 1.0
-    poll_enabled: bool = False
+    poll_enabled: bool = True
 
 
 @dataclass

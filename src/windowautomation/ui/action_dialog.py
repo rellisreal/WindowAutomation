@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit, QSpinBox
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLineEdit, QSpinBox
 
 from windowautomation.config import Action, Config
 
@@ -24,6 +24,8 @@ class ActionDialog(QDialog):
         self.interval.setRange(0.1, 60.0)
         self.interval.setSuffix(" s")
         self.interval.setValue(action.poll_interval_s if action else 1.0)
+        self.poll_enabled = QCheckBox("Include in cycle")
+        self.poll_enabled.setChecked(action.poll_enabled if action else True)
         self.offset_x = QSpinBox()
         self.offset_x.setRange(-10000, 10000)
         self.offset_x.setValue(action.click_offset_x if action else 0)
@@ -36,6 +38,7 @@ class ActionDialog(QDialog):
         form.addRow("Template", self.template)
         form.addRow("Match threshold", self.threshold)
         form.addRow("Poll interval", self.interval)
+        form.addRow("Include in cycle", self.poll_enabled)
         form.addRow("Click offset X", self.offset_x)
         form.addRow("Click offset Y", self.offset_y)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -60,4 +63,5 @@ class ActionDialog(QDialog):
             click_offset_x=self.offset_x.value(),
             click_offset_y=self.offset_y.value(),
             poll_interval_s=self.interval.value(),
+            poll_enabled=self.poll_enabled.isChecked(),
         )
